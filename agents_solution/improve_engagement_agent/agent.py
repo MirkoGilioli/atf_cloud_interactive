@@ -128,5 +128,5 @@ root_agent = LlmAgent(
         "specialized agents, and presents actionable insights."
     ),
     instruction=IMPROVE_ENGAGEMENT_INSTRUCTION,
-    tools=[data_tool, intervention_tool],
+    tools=[data_tool,],
 )
