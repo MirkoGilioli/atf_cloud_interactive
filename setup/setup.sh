@@ -3,7 +3,8 @@
 #
 # Provisions: APIs, service accounts, IAM roles, GCS buckets,
 #             reference doc upload, Vertex AI Search datastore,
-#             BigQuery dataset + synthetic data.
+#             BigQuery dataset + synthetic data,
+#             Cloud DLP & Model Armor templates, GCS MCP server.
 # Idempotent — safe to re-run.
 #
 # Usage:
@@ -19,6 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 REGION="${REGION:-us-central1}"
 DATASTORE_ID="${DATASTORE_ID:-cymbal-meet-docs}"
+MODEL_ARMOR_LOCATION="${MODEL_ARMOR_LOCATION:-us}"
+MODEL_ARMOR_TEMPLATE_ID="${MODEL_ARMOR_TEMPLATE_ID:-mask_emails}"
 
 # Prompt for project ID if not set
 if [[ -z "${PROJECT_ID:-}" ]]; then
@@ -61,6 +64,7 @@ echo "============================================"
 echo " Project:    $PROJECT_ID ($PROJECT_NUMBER)"
 echo " Region:     $REGION"
 echo " Datastore:  $DATASTORE_ID"
+echo " ModelArmor: $MODEL_ARMOR_TEMPLATE_ID ($MODEL_ARMOR_LOCATION)"
 echo "============================================"
 echo ""
 
@@ -82,6 +86,8 @@ gcloud services enable \
   monitoring.googleapis.com \
   compute.googleapis.com \
   iam.googleapis.com \
+  dlp.googleapis.com \
+  modelarmor.googleapis.com \
   --project="$PROJECT_ID" \
   --quiet
 
@@ -94,14 +100,6 @@ gcloud beta services mcp enable bigquery.googleapis.com \
   --project="$PROJECT_ID" \
   --quiet 2>/dev/null || true
 echo "    BigQuery MCP enabled."
-echo ""
-
-echo ""
-echo ">>> Granting MCP Tool User role to agent service account..."
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:${AGENT_SA_EMAIL}" \
-  --role="roles/mcp.toolUser" \
-  --quiet
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -146,6 +144,7 @@ AGENT_ROLES=(
   "roles/monitoring.metricWriter"
   "roles/serviceusage.serviceUsageAdmin"
   "roles/modelarmor.user"
+  "roles/mcp.toolUser"
 )
 
 for role in "${AGENT_ROLES[@]}"; do
@@ -259,9 +258,18 @@ echo ">>> Phase 7: Creating BigQuery tables and loading synthetic data..."
 echo ""
 
 # ---------------------------------------------------------------------------
-# Phase 8 — Deploy GCS MCP server to Cloud Run
+# Phase 8 — Model Armor & DLP templates (Email inspection & redaction)
 # ---------------------------------------------------------------------------
-echo ">>> Phase 8: Deploying GCS MCP server to Cloud Run..."
+echo ">>> Phase 8: Creating Model Armor and DLP templates..."
+MODEL_ARMOR_LOCATION="$MODEL_ARMOR_LOCATION" \
+MODEL_ARMOR_TEMPLATE_ID="$MODEL_ARMOR_TEMPLATE_ID" \
+"$VENV_DIR/bin/python" "$SCRIPT_DIR/create_model_armor.py"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Deploy GCS MCP server to Cloud Run
+# ---------------------------------------------------------------------------
+echo ">>> Phase 9: Deploying GCS MCP server to Cloud Run..."
 
 SERVICE_NAME="gcs-mcp-server"
 SOURCE_DIR="${SCRIPT_DIR}/gcs-mcp-server"
@@ -345,6 +353,12 @@ check() {
 check "APIs enabled (aiplatform)" \
   "gcloud services list --enabled --project=$PROJECT_ID --filter='name:aiplatform.googleapis.com' --format='value(name)' | grep -q aiplatform"
 
+check "APIs enabled (modelarmor)" \
+  "gcloud services list --enabled --project=$PROJECT_ID --filter='name:modelarmor.googleapis.com' --format='value(name)' | grep -q modelarmor"
+
+check "APIs enabled (dlp)" \
+  "gcloud services list --enabled --project=$PROJECT_ID --filter='name:dlp.googleapis.com' --format='value(name)' | grep -q dlp"
+
 check "BigQuery MCP enabled" \
   "gcloud beta services mcp list --project=$PROJECT_ID 2>/dev/null | grep -q bigquery"
 
@@ -388,6 +402,10 @@ check "BigQuery table: device_telemetry" \
 check "BigQuery table: calls" \
   "bq show --project_id=$PROJECT_ID cymbal_meet.calls"
 
+# Model Armor
+check "Model Armor template exists ($MODEL_ARMOR_TEMPLATE_ID)" \
+  "gcloud beta model-armor templates describe $MODEL_ARMOR_TEMPLATE_ID --location=$MODEL_ARMOR_LOCATION --project=$PROJECT_ID"
+
 # Cloud Run
 check "GCS MCP server deployed ($SERVICE_NAME)" \
   "gcloud run services describe $SERVICE_NAME --region=$REGION --project=$PROJECT_ID"
@@ -406,6 +424,7 @@ echo " All setup complete!"
 echo "============================================"
 echo ""
 echo "GCS MCP endpoint: $MCP_ENDPOINT"
+echo "Model Armor template: projects/$PROJECT_ID/locations/$MODEL_ARMOR_LOCATION/templates/$MODEL_ARMOR_TEMPLATE_ID"
 echo ""
 echo "Next steps:"
 echo "  1. Test data agent locally: cd agents/data_agent && adk web"
